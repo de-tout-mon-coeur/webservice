@@ -1,59 +1,114 @@
-# main.py — с логированием и фиксом gzip
 import os
+import asyncio
+import logging
 import httpx
 from fastapi import FastAPI, Request, Response
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Таймаут выставлен с запасом относительно клиентского (120 с).
+# Gemini может думать над большим изображением 60–90 с.
+PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=150.0, write=60.0, pool=15.0)
+
+# Коды ответа от Gemini, при которых стоит повторить попытку
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = 3
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy_gemini(request: Request, path: str):
-    print(f"📥 Получен запрос: {request.method} /{path}")
-    print(f"   Заголовки: {dict(request.headers)}")
+    logger.info("📥 %s /%s  content-length=%s",
+                request.method, path, request.headers.get("content-length", "?"))
 
-    # Извлекаем query string, но НЕ ожидаем ключа от клиента
     query = request.url.query
-    if query:
-        print(f"   Query string: {query}")
-
-    # ВСЕГДА используем внутренний ключ
     target_url = f"{GEMINI_BASE_URL}/{path}?key={API_KEY}"
     if query:
-        # Если клиент прислал параметры (например, &alt=json), добавляем их
         target_url += "&" + query
 
-    print(f"➡️  Проксируем в: {target_url.split('key=')[0]}key=***")
+    logger.info("➡️  target: .../%s?key=***", path)
 
-    headers = {k: v for k, v in request.headers.items() if k not in ("host", "content-length", "accept-encoding")}
-    # ↑ Убираем accept-encoding, чтобы Google не сжимал ответ!
-    headers["accept-encoding"] = "identity"  # ← ГОВОРИМ GOOGLE: НЕ СЖИМАЙ!
+    # Убираем заголовки, которые не нужно пробрасывать
+    forward_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "accept-encoding",
+                             "transfer-encoding", "connection")
+    }
+    # Просим Google не сжимать ответ, чтобы не разжимать его в прокси
+    forward_headers["accept-encoding"] = "identity"
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            body = await request.body()
-            gemini_resp = await client.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                content=body,
-            )
+    body = await request.body()
 
-        print(f"⬅️  Ответ от Google: {gemini_resp.status_code}")
-        print(f"   Заголовки от Google: {dict(gemini_resp.headers)}")
+    last_status = 500
+    last_content = b"Proxy error: unknown"
+    last_headers: dict = {}
 
-        # Убираем проблемные заголовки
-        resp_headers = dict(gemini_resp.headers)
-        resp_headers.pop("content-encoding", None)
-        resp_headers.pop("content-length", None)
+    async with httpx.AsyncClient(timeout=PROXY_TIMEOUT) as client:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                gemini_resp = await client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=forward_headers,
+                    content=body,
+                )
+                logger.info("⬅️  attempt=%d status=%d", attempt, gemini_resp.status_code)
 
-        return Response(
-            content=gemini_resp.content,
-            status_code=gemini_resp.status_code,
-            headers=resp_headers,
-        )
+                if gemini_resp.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                    wait = 2 ** attempt  # 2, 4 сек
+                    logger.warning("🔄 retryable status %d, waiting %ds before retry %d/%d",
+                                   gemini_resp.status_code, wait, attempt + 1, MAX_RETRIES)
+                    await asyncio.sleep(wait)
+                    last_status = gemini_resp.status_code
+                    last_content = gemini_resp.content
+                    last_headers = dict(gemini_resp.headers)
+                    continue
 
-    except Exception as e:
-        print(f"💥 Ошибка в прокси: {e}")
-        return Response(content=f"Proxy error: {str(e)}", status_code=500)
+                # Успех или неповторяемая ошибка — отдаём как есть
+                resp_headers = dict(gemini_resp.headers)
+                resp_headers.pop("content-encoding", None)
+                resp_headers.pop("content-length", None)
+                resp_headers.pop("transfer-encoding", None)
+
+                return Response(
+                    content=gemini_resp.content,
+                    status_code=gemini_resp.status_code,
+                    headers=resp_headers,
+                )
+
+            except httpx.ReadTimeout:
+                logger.error("💥 attempt=%d ReadTimeout (Gemini не ответил за %.0fs)",
+                             attempt, PROXY_TIMEOUT.read)
+                last_content = b"Proxy error: Gemini read timeout"
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+            except httpx.ConnectTimeout:
+                logger.error("💥 attempt=%d ConnectTimeout", attempt)
+                last_content = b"Proxy error: connect timeout"
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+            except httpx.RequestError as e:
+                logger.error("💥 attempt=%d RequestError: %r", attempt, e)
+                last_content = f"Proxy error: {type(e).__name__}: {e}".encode()
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+            except Exception as e:
+                logger.error("💥 attempt=%d unexpected: %r", attempt, e)
+                last_content = f"Proxy error: {type(e).__name__}: {e}".encode()
+                break
+
+    # Все попытки исчерпаны
+    resp_headers = {k: v for k, v in last_headers.items()
+                    if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")}
+    return Response(content=last_content, status_code=last_status or 500, headers=resp_headers)
